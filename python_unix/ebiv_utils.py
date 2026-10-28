@@ -51,7 +51,7 @@ def EBILoadEvents(
         #num_bytes = binary_file.tell()  # Get the file size
         #print('file size: '+str(num_bytes))
         binary_file.seek(0)
-        header = binary_file.read( 48 )
+        header = binary_file.read( 64 )
         sig, fileSize, eventCnt, timeStamp, duration, hdrLen, w, h =\
             unpack('4s3Q4L',header)
         if not (sig == b'EVT3'):
@@ -109,8 +109,8 @@ def EBISaveEvents(fnOUT:str, evDict, offset = 0, duration = 0,):
     hdrLen = 64
     fileSize = hdrLen + (eventCnt*8)
     fillVal = 0
-    header = pack('4s3Q4L2Q', sig, fileSize, eventCnt, timeStamp, duration, 
-                  hdrLen, w, h, fillVal,fillVal)
+    header = pack('4s3Q4L', sig, fileSize, eventCnt, timeStamp, duration,
+                  hdrLen, w, h)
     with open(fnOUT, "wb") as binary_file:
         nBytesWritten = binary_file.write( header )
         nBytesWritten2 = binary_file.write( packedData )
@@ -560,6 +560,151 @@ def FindPeakInObjectiveMap(
                         doExponentialFit=doExponentialFit)
 
     return [Vx,Vy,maxVar, maxEvents]
+
+def ComputeMotionField(event_set, frame_start, frame_duration, sample_size,
+                       sample_step, VxIN, VyIN, polarity='pos',
+                       objectiveFxn='var', interpolation='nearest',
+                       doExponentialFit=False, sample_bounds=None):
+    """Compute one motion-compensation velocity field from sampled events."""
+    imgH, imgW = event_set.imageSize()
+    sampleW, sampleH = sample_size
+    stepX, stepY = sample_step
+    velData = []
+
+    x_start, x_stop, y_start, y_stop = _sample_bounds(
+        imgW, imgH, sampleW, sampleH, stepX, stepY, sample_bounds)
+    for iy in range(y_start, y_stop, stepY):
+        for ix in range(x_start, x_stop, stepX):
+            sample = event_set.sampleEvents(
+                [ix, iy], [sampleW, sampleH],
+                [frame_start, frame_start + frame_duration],
+                polarity=polarity)
+            if sample.evData['time'].size == 0:
+                velData.append([sample.centroid[0], imgH - sample.centroid[1],
+                                0, 0, 0, 0])
+                continue
+            rewardMap, countsMap = CalcObjectiveForShift(
+                VxIN, VyIN, sample, objectiveFxn=objectiveFxn,
+                interpolation=interpolation)
+            Vx, Vy, peak, event_count = FindPeakInObjectiveMap(
+                rewardMap, countsMap, VxIN, VyIN,
+                doExponentialFit=doExponentialFit)
+            velData.append([sample.centroid[0], imgH - sample.centroid[1],
+                            Vx, Vy, peak, event_count])
+
+    ny = len(range(y_start, y_stop, stepY))
+    nx = len(range(x_start, x_stop, stepX))
+    return np.asarray(velData, dtype=float).reshape(ny, nx, 6)
+
+def _sample_bounds(imgW, imgH, sampleW, sampleH, stepX, stepY, bounds):
+    if bounds is None:
+        return 0, imgW - sampleW + 1, 0, imgH - sampleH + 1
+    x_min, y_min, x_max, y_max = [int(value) for value in bounds]
+    x_min = max(0, min(x_min, imgW - sampleW))
+    y_min = max(0, min(y_min, imgH - sampleH))
+    x_max = max(x_min + sampleW, min(x_max, imgW))
+    y_max = max(y_min + sampleH, min(y_max, imgH))
+    return x_min, x_max - sampleW + 1, y_min, y_max - sampleH + 1
+
+def ComputeMotionFieldGPU(event_set, frame_start, frame_duration, sample_size,
+                          sample_step, VxIN, VyIN, polarity='pos',
+                          objectiveFxn='var', interpolation='bilinear',
+                          doExponentialFit=False,
+                          candidate_batch=64, sample_bounds=None):
+    """Compute one motion field using CuPy for the objective evaluation."""
+    try:
+        import cupy as cp
+        from cupyx import scatter_add
+    except ImportError as exc:
+        raise ImportError(
+            'ComputeMotionFieldGPU requires cupy-cuda12x in the notebook kernel') from exc
+
+    if objectiveFxn.lower() not in ['var', 'variance']:
+        raise ValueError('GPU motion compensation currently supports objectiveFxn="var" only')
+    if interpolation not in ['nearest', 'bilinear']:
+        raise ValueError('GPU motion compensation supports nearest or bilinear interpolation')
+
+    imgH, imgW = event_set.imageSize()
+    sampleW, sampleH = sample_size
+    stepX, stepY = sample_step
+    vx_candidates = cp.asarray(np.asarray(VxIN, dtype=np.float32))
+    vy_candidates = cp.asarray(np.asarray(VyIN, dtype=np.float32))
+    candidate_vx, candidate_vy = cp.meshgrid(vx_candidates, vy_candidates)
+    candidate_vx = candidate_vx.ravel()
+    candidate_vy = candidate_vy.ravel()
+    n_candidates = candidate_vx.size
+    velData = []
+
+    x_start, x_stop, y_start, y_stop = _sample_bounds(
+        imgW, imgH, sampleW, sampleH, stepX, stepY, sample_bounds)
+    for iy in range(y_start, y_stop, stepY):
+        for ix in range(x_start, x_stop, stepX):
+            sample = event_set.sampleEvents(
+                [ix, iy], [sampleW, sampleH],
+                [frame_start, frame_start + frame_duration],
+                polarity=polarity)
+            if sample.evData['time'].size == 0:
+                velData.append([sample.centroid[0], imgH - sample.centroid[1],
+                                0, 0, 0, 0])
+                continue
+
+            event_time = cp.asarray(sample.evData['time'], dtype=cp.float32)
+            event_x = cp.asarray(sample.evData['x'], dtype=cp.float32)
+            event_y = cp.asarray(sample.evData['y'], dtype=cp.float32)
+            time_mean = (sample.evData['roiTime'][1] - sample.evData['roiTime'][0]) / 2
+            rewards = cp.empty(n_candidates, dtype=cp.float32)
+            counts = cp.empty(n_candidates, dtype=cp.int32)
+
+            for start in range(0, n_candidates, candidate_batch):
+                stop = min(start + candidate_batch, n_candidates)
+                vx = candidate_vx[start:stop, None] / 1000
+                vy = candidate_vy[start:stop, None] / 1000
+                warp_x = event_x[None, :] - (event_time[None, :] - time_mean) * vx
+                warp_y = event_y[None, :] - (event_time[None, :] - time_mean) * vy
+                if interpolation == 'nearest':
+                    pix_x = cp.rint(warp_x).astype(cp.int32)
+                    pix_y = cp.rint(warp_y).astype(cp.int32)
+                    valid = ((pix_x >= 0) & (pix_y >= 0) &
+                             (pix_x < sampleW) & (pix_y < sampleH))
+                    pix_x = cp.where(valid, pix_x, 0)
+                    pix_y = cp.where(valid, pix_y, 0)
+                    warped = cp.zeros((stop - start, sampleH, sampleW), dtype=cp.float32)
+                    batch_idx = cp.broadcast_to(cp.arange(stop - start)[:, None], pix_x.shape)
+                    scatter_add(warped, (batch_idx, pix_y, pix_x), valid.astype(cp.float32))
+                else:
+                    pix_x = cp.floor(warp_x).astype(cp.int32)
+                    pix_y = cp.floor(warp_y).astype(cp.int32)
+                    valid = ((pix_x >= 0) & (pix_y >= 0) &
+                             (pix_x < sampleW - 1) & (pix_y < sampleH - 1))
+                    safe_x = cp.where(valid, pix_x, 0)
+                    safe_y = cp.where(valid, pix_y, 0)
+                    weight_x = warp_x - pix_x
+                    weight_y = warp_y - pix_y
+                    batch_idx = cp.broadcast_to(cp.arange(stop - start)[:, None], safe_x.shape)
+                    warped = cp.zeros((stop - start, sampleH, sampleW), dtype=cp.float32)
+                    scatter_add(warped, (batch_idx, safe_y, safe_x),
+                                (weight_y * weight_x * valid).astype(cp.float32))
+                    scatter_add(warped, (batch_idx, safe_y, safe_x + 1),
+                                (weight_y * (1 - weight_x) * valid).astype(cp.float32))
+                    scatter_add(warped, (batch_idx, safe_y + 1, safe_x),
+                                ((1 - weight_y) * weight_x * valid).astype(cp.float32))
+                    scatter_add(warped, (batch_idx, safe_y + 1, safe_x + 1),
+                                ((1 - weight_y) * (1 - weight_x) * valid).astype(cp.float32))
+                rewards[start:stop] = warped.var(axis=(1, 2))
+                counts[start:stop] = valid.sum(axis=1)
+
+            reward_map = cp.asnumpy(rewards).reshape(vy_candidates.size, vx_candidates.size)
+            count_map = cp.asnumpy(counts).reshape(vy_candidates.size, vx_candidates.size)
+            Vx, Vy, peak, event_count = FindPeakInObjectiveMap(
+                reward_map, count_map, np.asarray(VxIN), np.asarray(VyIN),
+                doExponentialFit=doExponentialFit)
+            velData.append([sample.centroid[0], imgH - sample.centroid[1],
+                            Vx, Vy, peak, event_count])
+
+    cp.cuda.Stream.null.synchronize()
+    ny = len(range(y_start, y_stop, stepY))
+    nx = len(range(x_start, x_stop, stepX))
+    return np.asarray(velData, dtype=float).reshape(ny, nx, 6)
 
 import numpy.fft
 from scipy.signal import fftconvolve

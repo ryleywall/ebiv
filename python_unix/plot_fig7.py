@@ -16,7 +16,7 @@ import matplotlib.patches as mpatches
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 useROI = 1      # plots small ROIs shown in Fig.8
-savePlot = 0    # generate output
+savePlot = 1    # generate output
 
 #%% Processing parameters
 dataDir = '../sample_data/'

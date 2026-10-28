@@ -41,6 +41,7 @@ class EBIV_Config:
         self.config_file = config_file
 
         sec = self.parser['DEFAULT']
+        self.doSingleTimeStep = sec.getboolean('doSingleTimeStep', self.doSingleTimeStep)
         # event sampling in time
         self.t_start  = sec.getint('SampleTimeStart', 10000)
         self.t_end    = sec.getint('SampleTimeEnd',  10000)
@@ -56,6 +57,9 @@ class EBIV_Config:
         self.polarity = sec.get('EventPolarity')
 
         self.doGaussPeakFit = sec.getboolean('DoGaussPeakFit', True)
+        self.fileStub = sec.get('FileStub', self.fileStub)
+        self.imgW = sec.getint('ImageWidth', self.imgW)
+        self.imgH = sec.getint('ImageHeight', self.imgH)
         
         # for sum-of-correlation approach
         sec = self.parser['CORR_SUM']
@@ -98,7 +102,7 @@ class EBIV_Config:
 
 if __name__ == '__main__':
     # for testing...
-    cfgFile = '../sample_data/ebiv_params.cfg'
+    cfgFile = '../../ebiv_pipeline/config/ebiv_params.cfg'
     
     cfg = EBIV_Config(cfgFile)
     #cfg.save_config('current.cfg')

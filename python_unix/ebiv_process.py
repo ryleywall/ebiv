@@ -1,134 +1,141 @@
-# -*- coding: utf-8 -*-
-"""
-@author: Chris Willert (cewdlr)
+"""Compute EBIV velocity fields, either as a class or a CLI script."""
 
-CopyPolicy: 
-    Released under the terms of the LGPLv2.1 or later, see LGPL.TXT
-
-Purpose:
-    Compute velocity field from event-data using sum-of-correlation 
-    or motion-compensation methods on actual data.
-    
-    Not the fastest, but serves to show the concepts
-"""
-
-#from pyebiv import EBIV
-from ebiv_utils import EBIDataSet,FFT_CrossCorr2D,FindCorrPeak2D, \
-    CalcObjectiveForShift, FindPeakInObjectiveMap
-from ebiv_params import EBIV_Config
-
-import numpy as np
 import os
+import sys
 from time import time
 
-tim0=time()
+import numpy as np
 
-# Processing parameters
-dataDir = '../sample_data/'
-cfgFile = dataDir + 'ebiv_params.cfg'
-cfg = EBIV_Config(cfgFile)
-
-#cfg.fileStub = 'wallflow4_dense_3'
-fnRAW = cfg.rawFile()
-fnEVT = cfg.rawFile(ext='.evt')
-if os.path.isfile(fnEVT): fnRAW = fnEVT
-
-evalMethods = ['motion_comp', 'corr_sum']
-cfg.evalMethod = evalMethods[0]
-
-if not os.path.isfile(fnRAW):
-    raise IOError('File not found: ' + fnRAW)
-
-VxIN = np.arange( cfg.VxMin, cfg.VxMax+cfg.velResolX, cfg.velResolX)
-VyIN = np.arange( cfg.VyMin, cfg.VyMax+cfg.velResolY, cfg.velResolY)
+from ebiv_params import EBIV_Config
+from ebiv_utils import ComputeMotionField, ComputeMotionFieldGPU, EBIDataSet, _sample_bounds
 
 
-#%% Load events from file and compute variance map
-print("Loading events from: " + fnRAW )
-ev = EBIDataSet(fnRAW)
-imgH,imgW = ev.imageSize()
-szSample = [cfg.sampleW,cfg.sampleH]
+class EBIVProcessor:
+    """Run the existing EBIV velocity-field implementation for one config."""
 
-velData = []
-cnt = 0
-nt = 0
-tim1=time()
+    def __init__(self, config_file, bbox=None):
+        self.config_file = os.path.abspath(str(config_file))
+        self.cfg = EBIV_Config(self.config_file)
+        trial_dir = os.path.dirname(self.config_file)
+        self.cfg.dataDir = trial_dir + os.sep
+        self.cfg.destDir = self.cfg.dataDir
+        self.cfg.plotDir = os.path.join(self.cfg.destDir, 'plots') + os.sep
+        self.event_file = self.cfg.rawFile(ext='.evt')
+        self.duration_seconds = 0.0
+        self.bbox = self._normalize_bbox(bbox)
 
-for t_0 in range(cfg.t_start, cfg.t_end, cfg.t_step):
-    timeSample = [t_0, t_0 + cfg.t_sample]
-    # offset symmetrically in time backward and forward
-    timeSample1 = [timeSample[0]-cfg.t_sep//2, timeSample[1]-cfg.t_sep//2]
-    timeSample2 = [timeSample[0]+cfg.t_sep//2, timeSample[1]+cfg.t_sep//2]
-    nt += 1
-    ny = 0
-    for iy in range(0,imgH-cfg.sampleH+1, cfg.sampleStepY):
-        nx = 0
-        ny += 1
-        for ix in range(0,imgW-cfg.sampleW+1, cfg.sampleStepX):
-            pos = [ix,iy]
-            nx += 1
-            if cfg.evalMethod in ['motion_comp', 'motion']:
-                s1 = ev.sampleEvents(pos, szSample, timeSample, polarity=cfg.polarity)
-                rewardMap, cntsMap = CalcObjectiveForShift(VxIN, VyIN, s1, \
-                                                           objectiveFxn=cfg.objectiveFxn,
-                                                           interpolation=cfg.interpolation)
-                [Vx,Vy,maxVar,evCnt] = FindPeakInObjectiveMap(
-                    rewardMap, cntsMap, VxIN, VyIN, doExponentialFit=cfg.doGaussPeakFit )
-                dt = (s1.evData['roiTime'][1]-s1.evData['roiTime'][0])
-                dx = Vx * dt/1000
-                dy = Vy * dt/1000
-                # print('[%4d %4d]  vx: %.4f vy:%.4f [px/ms]  shift [px]: %.2f  %.2f  (var=%.3f, cnt=%d)' \
-                #       %(ix+sampleW/2,iy+sampleH/2, -Vx, -Vy, -dx, -dy, maxVar, evCnt))
-    
-            elif cfg.evalMethod in ['corr', 'corr_sum']:
-                s1 = ev.sampleEvents(pos, szSample, timeSample1, polarity=cfg.polarity)
-                s2 = ev.sampleEvents(pos, szSample, timeSample2, polarity=cfg.polarity)
-                evCnt1 = s1.evData['time'].size
-                evCnt2 = s2.evData['time'].size
-                #evCnt1 = 0
-                if evCnt1 == 0 or evCnt2 == 0:
-                    # print("[%4d %4d]  no events"%(ix,iy))
-                    Vx = 0
-                    Vy = 0
-                    dx = 0
-                    dx = 0
-                    maxVar = 0
-                    evCnt = 0
-                else:
-                    evCnt = (evCnt1+ evCnt2)//2
-                    vol1 = s1.asVolume(cfg.NT)
-                    vol2 = s2.asVolume(cfg.NT)
-                    corr = FFT_CrossCorr2D(vol1,vol2)
-                    corr2D = corr.sum(axis=0)
-                    corr_dx,corr_dy,maxCorr = FindCorrPeak2D(corr2D)
-                    corr_vx = (corr_dx/cfg.t_sep)*1000
-                    corr_vy = (corr_dy/cfg.t_sep)*1000
-                    # print('[%4d %4d]  dx:%.4f dy:%.4f  vx:%.4f vy:%.4f  corr: %.4f' \
-                    #       %(ix+sampleW/2,iy+sampleH/2, corr_dx, -corr_dy, corr_vx, -corr_vy, maxCorr))
-                    Vx = corr_vx
-                    Vy = corr_vy
-                    dx = corr_dx
-                    dx = corr_dy
-                    maxVar = maxCorr
-            print('[%4d %4d]  vx: %.4f vy:%.4f [px/ms]  (peakval=%.3f, evtcnt=%d)' \
-                  %(ix+cfg.sampleW/2,iy+cfg.sampleH/2, -Vx, -Vy, maxVar, evCnt))
-            velData.append([s1.centroid[0], imgH-s1.centroid[1], Vx,Vy, maxVar,evCnt])
-            cnt+=1
+    def _normalize_bbox(self, bbox):
+        if bbox is None:
+            return None
+        x_min, y_min, x_max, y_max = [int(round(value)) for value in bbox]
+        x_min = max(0, min(x_min, self.cfg.imgW - self.cfg.sampleW))
+        y_min = max(0, min(y_min, self.cfg.imgH - self.cfg.sampleH))
+        x_max = max(x_min + self.cfg.sampleW, min(x_max, self.cfg.imgW))
+        y_max = max(y_min + self.cfg.sampleH, min(y_max, self.cfg.imgH))
+        return np.asarray([x_min, y_min, x_max, y_max], dtype=np.int32)
 
-    if cfg.doSingleTimeStep:
-        break
+    def run(self):
+        tim0 = time()
+        if not os.path.isfile(self.event_file):
+            raise IOError('File not found: ' + self.event_file)
+        vx_in = np.arange(self.cfg.VxMin, self.cfg.VxMax + self.cfg.velResolX, self.cfg.velResolX)
+        vy_in = np.arange(self.cfg.VyMin, self.cfg.VyMax + self.cfg.velResolY, self.cfg.velResolY)
+        use_cuda, cuda_status = self._cuda_status()
+        print('CUDA acceleration: %s (%s)' % ('enabled' if use_cuda else 'disabled', cuda_status))
+        print('Loading events from: ' + self.event_file)
+        ev = EBIDataSet(self.event_file)
+        img_h, img_w = ev.imageSize()
+        sample_size = [self.cfg.sampleW, self.cfg.sampleH]
+        input_duration = ev.evData['t'].max() - ev.evData['t'].min()
+        print('Window length: %.3f ms' % (self.cfg.t_sample / 1000))
+        print('Input file duration: %.3f ms' % (input_duration / 1000))
+        velocity_dir = os.path.join(self.cfg.destDir, 'velocity_fields', self.cfg.fileStub)
+        os.makedirs(velocity_dir, exist_ok=True)
+        time_starts = list(range(self.cfg.t_start, self.cfg.t_end, self.cfg.t_step))
+        if self.cfg.doSingleTimeStep:
+            time_starts = time_starts[:1]
+        x_start, x_stop, y_start, y_stop = _sample_bounds(
+            img_w, img_h, self.cfg.sampleW, self.cfg.sampleH,
+            self.cfg.sampleStepX, self.cfg.sampleStepY, self.bbox)
+        nx_total = len(range(x_start, x_stop, self.cfg.sampleStepX))
+        ny_total = len(range(y_start, y_stop, self.cfg.sampleStepY))
+        total_positions = len(time_starts) * ny_total * nx_total
 
-if cnt == 0 or nt == 0:
-    raise Exception('No data processed')
-tim2=time()
-print('Loading event data took %.1f s' % (tim1-tim0))
-print('Processing %d positions took %.1f min' % (cnt,(tim2-tim1)/60))
+        def update_progress(completed, total):
+            if total == 0:
+                return
+            width = 40
+            fraction = completed / total
+            filled = int(width * fraction)
+            bar = '#' * filled + '-' * (width - filled)
+            sys.stdout.write('\rProcessing velocity field [%s] %5.1f%% (%d/%d)' %
+                             (bar, fraction * 100, completed, total))
+            sys.stdout.flush()
 
-# final velocity data, reshaped as one time-step
-velDataOUT = np.array(velData).flatten().reshape(nt,ny,nx, 6)
+        compute_motion_field = ComputeMotionFieldGPU if use_cuda else ComputeMotionField
+        vel_data = []
+        count = 0
+        tim1 = time()
+        ny = nx = 0
+        for t_0 in time_starts:
+            window_data = compute_motion_field(
+                event_set=ev, frame_start=t_0, frame_duration=self.cfg.t_sample,
+                sample_size=sample_size,
+                sample_step=[self.cfg.sampleStepX, self.cfg.sampleStepY],
+                VxIN=vx_in, VyIN=vy_in, polarity=self.cfg.polarity,
+                objectiveFxn=self.cfg.objectiveFxn, interpolation=self.cfg.interpolation,
+                doExponentialFit=self.cfg.doGaussPeakFit, sample_bounds=self.bbox)
+            vel_data.append(window_data)
+            ny, nx, _ = window_data.shape
+            count += ny * nx
+            update_progress(count, total_positions)
+            window_file = os.path.join(velocity_dir, '%s_t%010dus.npz' % (self.cfg.fileStub, t_0))
+            np.savez(window_file, velData=window_data.reshape(1, ny, nx, 6),
+                     bbox=self.bbox if self.bbox is not None else np.asarray([], dtype=np.int32),
+                     image_size=np.asarray([img_h, img_w], dtype=np.int32))
+            sys.stdout.write('\nSaved velocity window: ' + window_file + '\n')
+        if total_positions > 0:
+            sys.stdout.write('\n')
+        if count == 0 or not vel_data:
+            raise RuntimeError('No data processed')
+        tim2 = time()
+        self.duration_seconds = max(float(input_duration) / 1_000_000, 1e-9)
+        print('Loading event data took %.1f s' % (tim1 - tim0))
+        print('Processing %d positions took %.1f min' % (count, (tim2 - tim1) / 60))
+        vel_data_out = np.asarray(vel_data).reshape(len(vel_data), ny, nx, 6)
+        combined_file = os.path.join(velocity_dir, self.cfg.velocityDataFile())
+        np.savez(combined_file, velData=vel_data_out,
+             bbox=self.bbox if self.bbox is not None else np.asarray([], dtype=np.int32),
+             image_size=np.asarray([img_h, img_w], dtype=np.int32))
+        print('Combined velocity data stored in: ' + combined_file)
+        return combined_file + '.npz'
 
-fnDataOUT = cfg.velocityDataFile()
-    
-# save as numpy file
-np.savez(cfg.destDir + fnDataOUT, velDataOUT)
-print('Velocity data stored in: ' + cfg.destDir + fnDataOUT)
+    @staticmethod
+    def _cuda_status():
+        use_cuda = False
+        cuda_status = 'CuPy is not installed'
+        try:
+            import cupy as cp
+            cuda_devices = cp.cuda.runtime.getDeviceCount()
+            if cuda_devices > 0:
+                use_cuda = True
+                cuda_status = '%d CUDA device(s) detected' % cuda_devices
+            else:
+                cuda_status = 'CuPy is installed, but no CUDA device was detected'
+        except ImportError:
+            pass
+        except Exception as exc:
+            cuda_status = 'CUDA check failed: %s' % exc
+        return use_cuda, cuda_status
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Compute EBIV velocity fields')
+    parser.add_argument('config_file', nargs='?', default='../../ebiv_pipeline/config/ebiv_params.cfg')
+    args = parser.parse_args()
+    EBIVProcessor(args.config_file).run()
+
+
+if __name__ == '__main__':
+    main()

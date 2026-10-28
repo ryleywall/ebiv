@@ -14,12 +14,17 @@ def SetFont(font):
     Allows to set either Times (Serif) of non-serif font 
     """
     import matplotlib as mpl
+    from matplotlib.font_manager import FontProperties, findfont
     if  font == 'Times' \
     or font == 'Roman' \
     or font == 'serif':
         mathtext = 'stix'
         fontFamily = 'serif'
-        fontSerif = "Times New Roman"
+        try:
+            findfont(FontProperties(family='Times New Roman'), fallback_to_default=False)
+            fontSerif = 'Times New Roman'
+        except ValueError:
+            fontSerif = 'DejaVu Serif'
     else:
         mathtext = 'dejavusans' # ['dejavusans', 'dejavuserif', 'cm', 'stix', 'stixsans', 'custom']
         fontFamily = 'sans'
